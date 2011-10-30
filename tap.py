@@ -3,6 +3,10 @@ import sys
 import apt_pkg
 import apt
 
+class InvalidOption(Exception):
+    def __init__(self, *args, **kwargs):
+        super(InvalidOption, self).__init__(*args, **kwargs)
+
 #
 # search
 #
@@ -10,82 +14,183 @@ import apt
 def namever_key(item):
     return item[0], item[1].package.name, item[1].version
 
-def and_(l, r):
-    def merge(p):
-        left = l(p)
-        if not left:
-            return []
-        right = r(p)
-        if not right:
-            return []
-        merged = sorted(left+right, key=namever_key)
-        results = [merged[i] for i in range(len(merged)-1)
-                   if namever_key(merged[i]) == namever_key(merged[i+1])]
-        return results
-    return merge
+class AndCombiner(object):
+    def __init__(self, left, right):
+        self.left, self.right = left, right
 
-def or_(l, r):
-    def merge(p):
-        left = l(p)
-        right = r(p)
-        merged = sorted(left+right, key=namever_key)
-        results = [merged[i] for i in range(len(merged))
-                   if i == 0 or namever_key(merged[i]) != namever_key(merged[i-1])]
-        return results
-    return merge
+    def match(self, package):
+        results = self.left.match(package)
+        if not results:
+            return []
+        return self.right.filter(results)
 
-def match_name(f):
-    def match(pkg):
+    def filter(self, results):
+        results = self.left.filter(results)
+        if not results:
+            return []
+        return self.right.filter(results)
+
+    def __repr__(self):
+        return "%s(%r, %r)" % (self.__class__.__name__, self.left, self.right)
+
+class OrCombiner(object):
+    def __init__(self, left, right):
+        self.left, self.right = left, right
+
+    def _combine(self, left, right):
+        merged = sorted(left+right, key=namever_key)
+        # filter out duplicates
+        keys = [namever_key(p) for p in merged]
+        return [merged[i] for i in range(len(merged))
+                if i == 0 or keys[i] != keys[i-1]]
+
+    def match(self, package):
+        left = self.left.match(package)
+        right = self.right.match(package)
+        return self._combine(left, right)
+
+    def filter(self, results):
+        left = self.left.filter(results)
+        right = self.right.filter(results)
+        return self._combine(left, right)
+
+    def __repr__(self):
+        return "%s(%r, %r)" % (self.__class__.__name__, self.left, self.right)
+
+class Contains(object):
+    def __init__(self, search):
+        self.search = search
+    def __call__(self, target):
+        return self.search in target
+    def __repr__(self):
+        return "%s(%r)" % (self.__class__.__name__, self.search)
+
+class ContainsNoCase(object):
+    def __init__(self, search):
+        self.search = search.lower()
+    def __call__(self, target):
+        return self.search in target.lower()
+    def __repr__(self):
+        return "%s(%r)" % (self.__class__.__name__, self.search)
+
+class ContainsRegex(object):
+    def __init__(self, pattern):
+        if not hasattr(pattern, 'search'):
+            import re
+            pattern = re.compile(pattern)
+        self.pattern = pattern
+    def __call__(self, target):
+        return bool(self.pattern.search(target))
+    def __repr__(self):
+        return "%s(%r)" % (self.__class__.__name__, self.pattern)
+
+class MatchName(object):
+    def __init__(self, matcher):
+        self.matcher = matcher
+
+    def match(self, package):
         results = []
-        for v in pkg.versions:
-            for provides in v.provides:
-                if f(provides):
-                    results.append((provides, v))
-        if f(pkg.name):
-            results.extend((pkg.name, v) for v in pkg.versions)
+        for v in package.versions:
+            results.extend(
+                (provides, v)
+                for provides in v.provides
+                if self.matcher(provides)
+            )
+        if self.matcher(package.name):
+            results.extend((package.name, v) for v in package.versions)
         return sorted(results, key=namever_key)
-    return match
 
-def match_desc(f):
-    def match(pkg):
+    def filter(self, results):
+        return [
+            result for result in results
+            if self.matcher(result[0])
+        ]
+
+    def __repr__(self):
+        return "%s(%r)" % (self.__class__.__name__, self.matcher)
+
+class MatchDesc(object):
+    def __init__(self, matcher):
+        self.matcher = matcher
+
+    def match(self, package):
         results = []
-        for v in pkg.versions:
-            if f(v._translated_records.long_desc):
-                for provides in v.provides:
-                    results.append((provides, v))
-                results.append((pkg.name, v))
-        return results
-    return match
+        for v in package.versions:
+            if self.matcher(v._translated_records.long_desc):
+                results.extend((provides, v) for provides in v.provides)
+                results.append((package.name, v))
+        return sorted(results, key=namever_key)
 
-def match_installed():
-    def match(pkg):
-        if pkg.installed:
-            return [(pkg.name, pkg.installed)]
+    def filter(self, results):
+        return [
+            result for result in results
+            if self.matcher(result[1]._translated_records.long_desc)
+        ]
+
+    def __repr__(self):
+        return "%s(%r)" % (self.__class__.__name__, self.matcher)
+
+class Installed(object):
+    def __init__(self):
+        pass
+
+    def match(self, package):
+        if package.installed:
+            return [(package.name, package.installed)]
         else:
             return []
-    return match
 
-def match_nonvirtual():
-    def match(pkg):
-        return [(pkg.name, v) for v in pkg.versions]
-    return match
+    def filter(self, results):
+        return [
+            result for result in results
+            if (result[1].package.name == result[0] and
+                result[1].package.installed == result[1])
+        ]
 
-def match_arch(arch):
-    if not arch:
-        arch = [apt_pkg.config.find("APT::Architecture"), 'all']
-    else:
-        arch = [arch]
-    def match(pkg):
+    def __repr__(self):
+        return "%s()" % (self.__class__.__name__,)
+
+class Nonvirtual(object):
+    def __init__(self):
+        pass
+
+    def match(self, package):
+        return [(package.name, v) for v in package.versions]
+
+    def filter(self, results):
+        return [r for r in results if r[0] == r[1].package.name]
+
+    def __repr__(self):
+        return "%s()" % (self.__class__.__name__,)
+
+class MatchArch(object):
+    def __init__(self, arch=None):
+        if not arch:
+            self.arch = [apt_pkg.config.find("APT::Architecture"), 'all']
+        elif isinstance(arch, str):
+            self.arch = [arch]
+        else:
+            self.arch = arch
+
+    def match(self, package):
         results = []
-        for v in pkg.versions:
-            if v.architecture not in arch:
+        for v in package.versions:
+            if v.architecture not in self.arch:
                 continue
             results.extend((provides, v) for provides in v.provides)
-            results.append((pkg.name, v))
+            results.append((package.name, v))
         return results
-    return match
 
-def search(opts, args):
+    def filter(self, results):
+        return [
+            result for result in results
+            if result[1].architecture in self.arch
+        ]
+
+    def __repr__(self):
+        return "%s(%r)" % (self.__class__.__name__, self.arch)
+
+def search(config, args):
 
     def make_search(arg):
         conds = []
@@ -108,11 +213,11 @@ def search(opts, args):
                 rem, arg = "", rem
 
             op = {
-                'n': lambda r: match_name(lambda n: r in n),
-                'd': lambda r: match_desc(lambda n: r.lower() in n.lower()),
-                'i': lambda r: match_installed(),
-                'a': lambda r: match_arch(r),
-                'p': lambda r: match_nonvirtual(),
+                'n': lambda r: MatchName(Contains(r)),
+                'd': lambda r: MatchDesc(ContainsNoCase(r)),
+                'i': lambda r: Installed(),
+                'a': lambda r: MatchArch(r),
+                'p': lambda r: Nonvirtual(),
             }[op]
             op = op(rem)
 
@@ -125,7 +230,7 @@ def search(opts, args):
         else:
             cond, conds = conds[-1], conds[:-1]
             while conds:
-                cond = and_(conds.pop(), cond)
+                cond = AndCombiner(conds.pop(), cond)
             return cond
 
     conds = []
@@ -139,17 +244,42 @@ def search(opts, args):
     else:
         cond, conds = conds[-1], conds[:-1]
         while conds:
-            cond = or_(conds.pop(), cond)
+            cond = OrCombiner(conds.pop(), cond)
+
+    print cond
 
     results = []
     if cond:
         cache = apt.Cache()
-        results = [cond(p) for p in cache]
+        results = [cond.match(p) for p in cache]
         import itertools
         results = sorted(
             itertools.chain(*results),
             key=namever_key
         )
+
+    if not results:
+        print "No results for search"
+        return 1
+
+    namelen = max(len(r[0]) for r in results)
+    verlen = max(len(r[1].version) for r in results)
+    default_format =  ('%%(state)s%%(automatic)s%%(upgrade)s'
+                       ' %%(arch)-6s'
+                       ' %%(name)-%(namelen)ds'
+                       ' %%(version)-%(verlen)ds'
+                       ' - %%(summary)s')
+    default_vformat = ('%%(state)s%%(automatic)s%%(upgrade)s'
+                       ' %%(arch)-6s'
+                       ' %%(name)-%(namelen)ds'
+                       ' ->'
+                       ' %%(packagename)s'
+                       ' %%(version)s')
+
+    format = config.get('format', default_format)
+    vformat = config.get('vformat', default_vformat)
+    format = format % dict(namelen=namelen, verlen=verlen)
+    vformat = vformat % dict(namelen=namelen, verlen=verlen)
 
     for name, version in results:
         package = version.package
@@ -205,37 +335,78 @@ def search(opts, args):
         if installed and package.is_upgradable:
             upgrade = 'u'
 
-        if virtual:
-            parts = [
-                state,
-                automatic,
-                upgrade,
-                ' %-6s ' % version.architecture,
-                name,
-                ' -> ',
-                package.name,
-                ' ',
-                version.version,
-            ]
-        else:
-            parts = [
-                state,
-                automatic,
-                upgrade,
-                ' %-6s ' % version.architecture,
-                name,
-                ' ',
-                version.version,
-            ]
-        print ''.join(parts)
+        lineformat = vformat if virtual else format
+        print lineformat % dict(
+            state=state,
+            automatic=automatic,
+            upgrade=upgrade,
+            arch=version.architecture,
+            name=name,
+            packagename=package.name,
+            version=version.version,
+            summary=version.summary,
+        )
 
 def search_help(config, argv):
     print "search help"
     sys.exit(0)
 
+def search_format(target, config, argv):
+    if not argv:
+        raise InvalidOption("format option requires format string argument")
+    fmtarg = argv[0]
+    format = ""
+    while fmtarg:
+        index = fmtarg.find('%')
+        if index < 0:
+            format += fmtarg
+            break
+        format, fmtarg = format+fmtarg[:index], fmtarg[index+1:]
+        align = False
+        if fmtarg[0] == '|':
+            align = True
+            fmtarg = fmtarg[1:]
+        fmtchar, fmtarg = fmtarg[0], fmtarg[1:]
+
+        if fmtchar == 'n':
+            if align:
+                format += '%%(name)-%(namelen)ds'
+            else:
+                format += '%%(name)s'
+        elif fmtchar == 'v':
+            if align:
+                format += '%%(version)-%(verlen)ds'
+            else:
+                format += '%%(version)s'
+        elif fmtchar == 'a':
+            if align:
+                format += '%%(arch)-6s'
+            else:
+                format += '%%(arch)s'
+        elif fmtchar == 'p':
+            format += '%%(packagename)s'
+        elif fmtchar == 'd':
+            format += '%%(summary)s'
+        elif fmtchar == 's':
+            format += '%%(state)s'
+        elif fmtchar == 'A':
+            format += '%%(automatic)s'
+        elif fmtchar == 'u':
+            format += '%%(upgrade)s'
+        else:
+            raise Exception("Unkown format character "+fmtchar)
+    config[target] = format
+    argv[:] = argv[1:]
+
+import functools
 search_options = {
     'h': search_help,
     'help': search_help,
+    'F': functools.partial(search_format, 'format'),
+    'format': functools.partial(search_format, 'format'),
+    'G': functools.partial(search_format, 'vformat'),
+    'vformat': functools.partial(search_format, 'vformat'),
+    'virtual-format': functools.partial(search_format, 'vformat'),
 }
 
 #
@@ -260,10 +431,6 @@ options = {
     'verbose': more_verbosity,
 }
 
-class InvalidOption(Exception):
-    def __init__(self, *args, **kwargs):
-        super(InvalidOption, self).__init__(*args, **kwargs)
-
 def main(argv):
 
     command = None
@@ -273,6 +440,9 @@ def main(argv):
     commands = {
         'search': (search, search_options)
     }
+
+    # Remove this line if Tap starts supporting multiple commands
+    command, command_options = commands["search"]
 
     while argv:
         arg = argv.pop(0)

@@ -8,7 +8,7 @@ class InvalidOption(Exception):
         super(InvalidOption, self).__init__(*args, **kwargs)
 
 #
-# search
+# search "AST"
 #
 
 def namever_key(item):
@@ -190,10 +190,15 @@ class MatchArch(object):
     def __repr__(self):
         return "%s(%r)" % (self.__class__.__name__, self.arch)
 
+#
+# command handling
+#
+
 def search(config, args):
 
     def make_search(arg):
         conds = []
+        has_arch = False
         while arg:
 
             if arg[0] == '~':
@@ -212,6 +217,12 @@ def search(config, args):
             else:
                 rem, arg = "", rem
 
+            if op == 'a':
+                has_arch = True
+                if rem == 'any':
+                    # skip constraint so all archs are matched
+                    continue
+
             op = {
                 'n': lambda r: MatchName(Contains(r)),
                 'd': lambda r: MatchDesc(ContainsNoCase(r)),
@@ -222,6 +233,9 @@ def search(config, args):
             op = op(rem)
 
             conds.append(op)
+
+        if conds and not has_arch:
+            conds.append(MatchArch(None))
 
         if not conds:
             return lambda pkg: []
